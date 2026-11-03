@@ -10,7 +10,7 @@ public sealed class OperationCoordinator : Harbor.Core.IOperationCoordinator
     public static void AssertStopped(Guid serverId)
     {
         var directory = Path.Combine(FoundationPaths.State, "locks"); Directory.CreateDirectory(directory);
-        try { using var probe = new FileStream(Path.Combine(directory,serverId+".process"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None); }
+        try { using var probe = new FileStream(Path.Combine(directory,serverId+".process"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None); ProcessOwnership.AssertNoSurvivingProcess(serverId); }
         catch (IOException e) { throw new InvalidOperationException("Stop this server in its owning Harbor application before editing its data.",e); }
     }
     public async Task<IAsyncDisposable> AcquireAsync(Guid serverId, CancellationToken cancellationToken = default)

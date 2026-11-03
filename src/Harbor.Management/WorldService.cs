@@ -111,7 +111,7 @@ public sealed class WorldService(IOperationCoordinator coordinator, IServerLifec
             if (!seen.Add(target)) throw new InvalidDataException("Duplicate world archive entry.");
             if (entry.FullName.EndsWith('/')) { Directory.CreateDirectory(target); continue; }
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            await using var input = entry.Open(); await using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true); await input.CopyToAsync(output, ct);
+            await using var output = new FileStream(target, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true); await BackupService.CopyEntryAsync(entry, output, ct);
         }
     }
 }

@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using Harbor.Core;
 using Harbor.Foundation;
+using Harbor.Management;
 using Xunit;
 
 namespace Harbor.Tests;
@@ -38,6 +39,13 @@ public sealed class LifecycleTests : IDisposable
         await lifecycle.SendCommandAsync(first.Id, "list");
         await echoed.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.NotEqual(lifecycle.GetMetrics(first.Id)!.ProcessId, lifecycle.GetMetrics(second.Id)!.ProcessId);
+        await using (var otherApplication = new ServerLifecycleManager(new OperationCoordinator()))
+        {
+            Assert.Equal(ServerState.Running, otherApplication.GetStatus(first.Id).State);
+            await Assert.ThrowsAnyAsync<InvalidOperationException>(() => new PropertiesService(new OperationCoordinator(), otherApplication).SaveAsync(first, new Dictionary<string,string>{{"motd","blocked"}}));
+            await Assert.ThrowsAnyAsync<InvalidOperationException>(() => otherApplication.StartAsync(first, Fixture(first)));
+            Assert.Equal(ServerState.Running,lifecycle.GetStatus(first.Id).State);
+        }
         await lifecycle.StopAsync(first.Id);
         Assert.Equal(ServerState.Stopped, lifecycle.GetStatus(first.Id).State);
         Assert.Equal(ServerState.Running, lifecycle.GetStatus(second.Id).State);

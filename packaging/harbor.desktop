@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Harbor
+Comment=Local Minecraft server manager
+Exec=harbor
+Icon=harbor
+Terminal=false
+Categories=Game;Utility;

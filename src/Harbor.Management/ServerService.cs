@@ -8,13 +8,37 @@ public sealed class ServerService(IServerRepository repository, IOperationCoordi
     private readonly StoppedOperations guard = new(coordinator, lifecycle);
     public async Task SaveAsync(ServerDefinition server, CancellationToken ct = default)
     {
-        await using var lease = await guard.EnterAsync(server, ct);
         ServerValidation.ThrowIfInvalid(server);
+        await using var registryLease = await coordinator.AcquireAsync(Guid.Empty, ct);
+        await using var lease = await guard.EnterAsync(server, ct);
+        var previous = (await repository.ListAsync(ct)).SingleOrDefault(s => s.Id == server.Id);
+        if (previous is not null && (Path.GetFullPath(previous.Directory) != Path.GetFullPath(server.Directory) || previous.MinecraftVersion != server.MinecraftVersion || previous.Loader != server.Loader || previous.LoaderVersion != server.LoaderVersion))
+            throw new InvalidOperationException("Changing an existing server's directory, Minecraft version or loader requires a separate reinstall/migration. Create a new server instead.");
         await ValidateUniqueAsync(server, ct);
-        await repository.SaveAsync(server, ct);
+        var propertiesPath = StoppedOperations.Child(server.Directory, "server.properties");
+        string? original = null;
+        var changedProperties = previous is not null && previous.Port != server.Port;
+        if (changedProperties)
+        {
+            original = File.Exists(propertiesPath) ? await File.ReadAllTextAsync(propertiesPath, ct) : null;
+            var properties = JavaProperties.Parse(original ?? "");
+            properties.Set("server-port", server.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            await StoppedOperations.AtomicWriteAsync(propertiesPath, properties.ToString(), ct);
+        }
+        try { await repository.SaveAsync(server, ct); }
+        catch
+        {
+            if (changedProperties)
+            {
+                if (original is null) File.Delete(propertiesPath);
+                else await StoppedOperations.AtomicWriteAsync(propertiesPath, original, CancellationToken.None);
+            }
+            throw;
+        }
     }
     public async Task<ServerDefinition> DuplicateAsync(ServerDefinition source, string name, string destinationDirectory, int port, CancellationToken ct = default)
     {
+        await using var registryLease = await coordinator.AcquireAsync(Guid.Empty, ct);
         await using var lease = await guard.EnterAsync(source, ct);
         var destination = Path.GetFullPath(destinationDirectory).TrimEnd('/');
         var original = Path.GetFullPath(source.Directory).TrimEnd('/');
@@ -23,7 +47,8 @@ public sealed class ServerService(IServerRepository repository, IOperationCoordi
         StoppedOperations.RejectLinks(destination);
         if (Directory.Exists(destination) || File.Exists(destination)) throw new IOException("Choose a new, nonexistent destination directory.");
         var duplicate = source with { Id = Guid.NewGuid(), Name = name, Directory = destination, Port = port, EulaAccepted = false, EulaAcceptedAt = null, CreatedAt = DateTimeOffset.UtcNow };
-        ServerValidation.ThrowIfInvalid(duplicate); await ValidateUniqueAsync(duplicate, ct);
+        ServerValidation.ThrowIfInvalid(duplicate);
+        await ValidateUniqueAsync(duplicate, ct);
         await using var newLease = await coordinator.AcquireAsync(duplicate.Id, ct);
         var stage = destination + ".duplicate-" + Guid.NewGuid().ToString("N"); Directory.CreateDirectory(stage);
         var moved = false;
@@ -44,6 +69,7 @@ public sealed class ServerService(IServerRepository repository, IOperationCoordi
     public async Task DeleteAsync(ServerDefinition server, bool deleteData, bool confirmed, CancellationToken ct = default)
     {
         if (!confirmed) throw new InvalidOperationException("Explicit confirmation is required to remove a server. Retained data is preserved unless deletion is selected.");
+        await using var registryLease = await coordinator.AcquireAsync(Guid.Empty, ct);
         await using var lease = await guard.EnterAsync(server, ct);
         StoppedOperations.RejectLinks(server.Directory);
         // Rename into a recoverable sibling first. A failed definition deletion restores original data.

@@ -38,14 +38,18 @@ public sealed class BackupService(IOperationCoordinator coordinator, IServerLife
         try
         {
             await ExtractVerifiedAsync(archive, stage, ct);
+            var propertiesPath = Path.Combine(stage, "server.properties");
+            var properties = JavaProperties.Parse(File.Exists(propertiesPath) ? await File.ReadAllTextAsync(propertiesPath, ct) : "");
+            properties.Set("server-port", server.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            await StoppedOperations.AtomicWriteAsync(propertiesPath, properties.ToString(), ct);
             if (Directory.Exists(target))
             {
                 // Refuse to replace files unless a separate recovery backup has completed.
                 await CreateUnlockedAsync(server, ct);
-                foreach (var filename in new[] { "eula.txt", "harbor-launch.json", "harbor-install.json" })
+                foreach (var filename in new[] { "eula.txt" })
                 {
                     var preserved = StoppedOperations.Child(target, filename);
-                    if (File.Exists(preserved) && filename == "eula.txt") File.Copy(preserved, Path.Combine(stage, filename), true);
+                    if (File.Exists(preserved)) File.Copy(preserved, Path.Combine(stage, filename), true);
                 }
             }
             ct.ThrowIfCancellationRequested();
@@ -145,6 +149,19 @@ public sealed class BackupService(IOperationCoordinator coordinator, IServerLife
         if (!destination.StartsWith(fullRoot, StringComparison.Ordinal)) throw new InvalidDataException("Archive entry escapes its destination.");
         return destination;
     }
+    internal static async Task CopyEntryAsync(ZipArchiveEntry entry, Stream destination, CancellationToken ct)
+    {
+        await using var source = entry.Open();
+        var buffer = new byte[81920]; long copied = 0;
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, ct); if (read == 0) break;
+            copied = checked(copied + read);
+            if (copied > entry.Length || copied > MaximumExpandedBytes) throw new InvalidDataException("Archive entry expands beyond its declared or permitted size.");
+            await destination.WriteAsync(buffer.AsMemory(0, read), ct);
+        }
+        if (copied != entry.Length) throw new InvalidDataException("Archive entry length does not match its metadata.");
+    }
     private static async Task ExtractVerifiedAsync(string path, string stage, CancellationToken ct)
     {
         using var zip = ZipFile.OpenRead(path);
@@ -155,7 +172,11 @@ public sealed class BackupService(IOperationCoordinator coordinator, IServerLife
         var manifestEntry = zip.GetEntry(ManifestName) ?? throw new InvalidDataException("Backup manifest is missing.");
         if (manifestEntry.Length > 32 * 1024 * 1024) throw new InvalidDataException("Manifest is too large.");
         Manifest manifest;
-        await using (var stream = manifestEntry.Open()) manifest = await JsonSerializer.DeserializeAsync<Manifest>(stream, cancellationToken: ct) ?? throw new InvalidDataException("Invalid backup manifest.");
+        using (var metadata = new MemoryStream())
+        {
+            await CopyEntryAsync(manifestEntry, metadata, ct); metadata.Position = 0;
+            manifest = await JsonSerializer.DeserializeAsync<Manifest>(metadata, cancellationToken: ct) ?? throw new InvalidDataException("Invalid backup manifest.");
+        }
         if (manifest.SchemaVersion != 1 || manifest.Kind != "full-server") throw new InvalidDataException("Unsupported backup schema or kind.");
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var entry in zip.Entries)
@@ -168,9 +189,8 @@ public sealed class BackupService(IOperationCoordinator coordinator, IServerLife
             if (entry.FullName.EndsWith('/')) { Directory.CreateDirectory(destination); continue; }
             if (!manifest.Checksums.TryGetValue(entry.FullName, out var checksum)) throw new InvalidDataException("File is missing from backup manifest.");
             Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            await using (var input = entry.Open())
             await using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
-                await input.CopyToAsync(output, ct);
+                await CopyEntryAsync(entry, output, ct);
             await using var verification = File.OpenRead(destination);
             if (!string.Equals(Convert.ToHexString(await SHA256.HashDataAsync(verification, ct)), checksum, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException($"Checksum failed for {entry.FullName}.");

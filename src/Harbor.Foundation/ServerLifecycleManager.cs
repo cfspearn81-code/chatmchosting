@@ -17,6 +17,9 @@ public sealed class ServerLifecycleManager(IOperationCoordinator coordinator) : 
         public SemaphoreSlim InputGate { get; } = new(1,1);
         public DateTimeOffset Started { get; } = DateTimeOffset.UtcNow;
         public Task Drain { get; set; } = Task.CompletedTask;
+        public Task Completion { get; set; } = Task.CompletedTask;
+        public object ExitGate { get; } = new();
+        public bool Exited { get; set; }
         public TimeSpan? LastCpu { get; set; }
         public DateTimeOffset LastSample { get; set; } = DateTimeOffset.UtcNow;
     }
@@ -30,7 +33,7 @@ public sealed class ServerLifecycleManager(IOperationCoordinator coordinator) : 
     {
         if (processes.ContainsKey(serverId)) return states.GetValueOrDefault(serverId) ?? new(serverId,ServerState.Starting);
         try { OperationCoordinator.AssertStopped(serverId); }
-        catch (InvalidOperationException) { return new(serverId,ServerState.Running,Error:"Owned by another Harbor application; status and metrics unavailable here."); }
+        catch (InvalidOperationException e) { return new(serverId,ServerState.Running,Error:e.Message); }
         return states.GetValueOrDefault(serverId) ?? new(serverId,ServerState.Stopped);
     }
     private void Set(Guid id,ServerState state,int? pid=null,string? error=null) { var value = new ServerStatus(id,state,pid,error); states[id]=value; StatusChanged?.Invoke(this,value); }
@@ -43,6 +46,7 @@ public sealed class ServerLifecycleManager(IOperationCoordinator coordinator) : 
         {
             ServerValidation.ThrowIfInvalid(server);
             if(processes.ContainsKey(server.Id)) throw new InvalidOperationException("Server already started.");
+            OperationCoordinator.AssertStopped(server.Id);
             if(!server.EulaAccepted) throw new InvalidOperationException("Explicit Minecraft EULA acceptance is required before starting. Read https://aka.ms/MinecraftEULA");
             if(server.Port is < 1 or > 65535 || server.MinimumMemoryMb < 128 || server.MaximumMemoryMb < server.MinimumMemoryMb) throw new ArgumentException("Invalid port or Java heap settings.");
             if(ports.Values.Contains(server.Port)) throw new InvalidOperationException("Another Harbor server uses this port.");
@@ -63,8 +67,11 @@ public sealed class ServerLifecycleManager(IOperationCoordinator coordinator) : 
             try { process.Start(); } catch { log.Dispose();process.Dispose();throw; }
             var owned = new Owned(process,ownership,log); ownership=null;
             processes[server.Id]=owned; ports[server.Id]=server.Port;
+            try { if(OperatingSystem.IsLinux()) ProcessOwnership.Write(server.Id,process); }
+            catch(Exception e) when(e is IOException or UnauthorizedAccessException or InvalidOperationException)
+            { OutputReceived?.Invoke(this,new ConsoleLine(server.Id,DateTimeOffset.UtcNow,"Warning: crash recovery evidence could not be saved: "+e.Message,true)); }
             owned.Drain=Task.WhenAll(Pump(server.Id,owned,process.StandardOutput,false),Pump(server.Id,owned,process.StandardError,true));
-            _ = ObserveExit(server.Id,owned);
+            owned.Completion = ObserveExit(server.Id,owned);
         }
         catch(Exception e) { ownership?.Dispose();if(!processes.ContainsKey(server.Id)) Set(server.Id,ServerState.Failed,error:e.Message);throw; }
         finally { starts.Release(); }
@@ -85,9 +92,14 @@ public sealed class ServerLifecycleManager(IOperationCoordinator coordinator) : 
         await owner.Process.WaitForExitAsync();
         try { await owner.Drain; } catch(Exception e) { Set(id,ServerState.Failed,error:"Log capture failed: "+e.Message); }
         var code=owner.Process.ExitCode;
-        processes.TryRemove(id,out _);ports.TryRemove(id,out _);
-        owner.Log.Dispose();owner.Ownership.Dispose();owner.Process.Dispose();
-        Set(id,code==0?ServerState.Stopped:ServerState.Failed,error:code==0?null:$"Server exited with code {code}. Inspect logs for startup evidence.");
+        lock(owner.ExitGate)
+        {
+            owner.Exited=true;
+            try { ProcessOwnership.Remove(id); } catch(IOException) { /* Stale records are checked against PID start time. */ }
+            owner.Log.Dispose();owner.Ownership.Dispose();owner.Process.Dispose();
+            Set(id,code==0?ServerState.Stopped:ServerState.Failed,error:code==0?null:$"Server exited with code {code}. Inspect logs for startup evidence.");
+            ports.TryRemove(id,out _);processes.TryRemove(id,out _);
+        }
     }
     public async Task SendCommandAsync(Guid serverId,string command,CancellationToken cancellationToken=default)
     {
@@ -100,13 +112,23 @@ public sealed class ServerLifecycleManager(IOperationCoordinator coordinator) : 
     public async Task StopAsync(Guid serverId,CancellationToken cancellationToken=default)
     {
         await using var operation=await coordinator.AcquireAsync(serverId,cancellationToken);
-        if(!processes.TryGetValue(serverId,out var owner)) return;
-        Set(serverId,ServerState.Stopping,owner.Process.Id);
-        await SendCommandAsync(serverId,"stop",cancellationToken);
-        await owner.Process.WaitForExitAsync(cancellationToken);
-        await owner.Drain.WaitAsync(cancellationToken);
-        // Ownership is released by ObserveExit; no unrelated PID is ever signalled.
-        while(processes.ContainsKey(serverId)) await Task.Delay(10,cancellationToken);
+        if(!processes.TryGetValue(serverId,out var owner)) { OperationCoordinator.AssertStopped(serverId); return; }
+        lock(owner.ExitGate)
+        {
+            if(!owner.Exited) Set(serverId,ServerState.Stopping,owner.Process.Id);
+        }
+        if(!owner.Exited)
+        {
+            try { await SendCommandAsync(serverId,"stop",cancellationToken); }
+            catch(Exception e) when(e is IOException or InvalidOperationException)
+            {
+                // An exit can close stdin between lookup and write. Await the observer only
+                // when exit was actually observed; real pipe failures on live servers propagate.
+                bool exited; lock(owner.ExitGate) exited=owner.Exited || owner.Process.HasExited;
+                if(!exited) throw;
+            }
+        }
+        await owner.Completion.WaitAsync(cancellationToken);
     }
     public ProcessMetrics? GetMetrics(Guid serverId)
     {
