@@ -1,0 +1,1 @@
+<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType></PropertyGroup><ItemGroup><ProjectReference Include="../../src/Harbor.Core/Harbor.Core.csproj"/><ProjectReference Include="../../src/Harbor.Foundation/Harbor.Foundation.csproj"/><ProjectReference Include="../../src/Harbor.Installers/Harbor.Installers.csproj"/></ItemGroup></Project>

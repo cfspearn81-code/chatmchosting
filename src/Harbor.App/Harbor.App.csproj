@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+<PropertyGroup><OutputType>WinExe</OutputType><AvaloniaUseCompiledBindingsByDefault>false</AvaloniaUseCompiledBindingsByDefault></PropertyGroup>
+<ItemGroup><PackageReference Include="Tmds.DBus.Protocol"/><PackageReference Include="Avalonia"/><PackageReference Include="Avalonia.Desktop"/><PackageReference Include="Avalonia.Themes.Fluent"/></ItemGroup>
+<ItemGroup><ProjectReference Include="../Harbor.Core/Harbor.Core.csproj"/><ProjectReference Include="../Harbor.Foundation/Harbor.Foundation.csproj"/><ProjectReference Include="../Harbor.Installers/Harbor.Installers.csproj"/><ProjectReference Include="../Harbor.Management/Harbor.Management.csproj"/></ItemGroup>
+</Project>
